@@ -137,14 +137,38 @@ def train_word_models(train: dict[str, list[np.ndarray]], n_states: int = 5, n_m
         uniform_segmentation_init(m, seqs, seed)
         X = np.concatenate(seqs)
         m.fit(X, lengths=[len(q) for q in seqs])
+        _repair_dead_components(m)
         if not np.all(np.isfinite(m.means_)) or not np.isfinite(m.transmat_).all():
             raise RuntimeError(f"training diverged for word {w}")
         models[w] = m
     return WordModels(models, n_states, n_mix, time.perf_counter() - t0)
 
 
+def _repair_dead_components(m: GMMHMM):
+    """Correctif (ajouté par le groupe) : pendant EM, une gaussienne peut ne plus recevoir aucune trame
+    (poids 0). Ses variances deviennent alors NaN (0/0), et ce NaN contamine TOUTES les log-vraisemblances
+    de l'état -> Viterbi ne peut plus décider (observé sur le modèle 'sil' : WER 100 %).
+    Une composante de poids 0 ne contribue pas au mélange : on lui donne des valeurs inoffensives
+    (poids exactement 0, moyenne/variance d'une composante saine), ce qui ne change pas le modèle."""
+    bad = ~np.isfinite(m.covars_).all(axis=-1) | ~np.isfinite(m.means_).all(axis=-1) | (m.weights_ <= 0)
+    if not bad.any():
+        return
+    for s, k in zip(*np.nonzero(bad)):
+        good = np.nonzero(~bad[s])[0]
+        ref = good[0] if len(good) else None
+        m.means_[s, k] = m.means_[s, ref] if ref is not None else 0.0
+        m.covars_[s, k] = m.covars_[s, ref] if ref is not None else 1.0
+        m.weights_[s, k] = 0.0
+    dead_states = m.weights_.sum(axis=1) == 0
+    m.weights_[dead_states] = 1.0 / m.n_mix  # cas extrême : aucune composante saine dans l'état
+    m.weights_ = m.weights_ / m.weights_.sum(axis=1, keepdims=True)
+
+
 def recognise_isolated(wm: WordModels, feats: np.ndarray, vocab: list[str]) -> str:
-    raise NotImplementedError("TODO(d1): return the word whose model gives the highest log-likelihood")
+    # On demande sa note (log-vraisemblance) à chaque modèle de mot, et on garde le mot qui a la meilleure.
+    # .score(feats) = log P(feats | modèle du mot), calculé par l'algorithme forward de hmmlearn.
+    scores = {w: wm.models[w].score(feats) for w in vocab}
+    return max(scores, key=scores.get)
 
 
 # --------------------------------------------------------------------------- #
@@ -177,7 +201,44 @@ class WordLoopDecoder:
         return self.lm_weight * np.log(max(self.bigram[u].get(v, 1e-12), 1e-12)) + self.word_penalty
 
     def _build(self):
-        raise NotImplementedError("TODO(d1): build the composite log transition matrix: within-word transitions + (word end -> word start) with lm_weight*log P(v|u) + word_penalty; start probabilities from P(v|<s>); mark entry transitions")
+        S = self.S
+        NEG = -np.inf
+        # logA[i, j] = log-score pour passer de l'état i à l'état j (-inf = transition interdite)
+        self.logA = np.full((S, S), NEG)
+        # is_entry[i, j] = True si la transition i -> j fait ENTRER dans un nouveau mot
+        self.is_entry = np.zeros((S, S), dtype=bool)
+        # log_start[j] = log-score pour commencer l'énoncé dans l'état j
+        self.log_start = np.full(S, NEG)
+        # is_final[j] = True si j est le dernier état d'un mot (on a le droit de finir l'énoncé là)
+        self.is_final = np.zeros(S, dtype=bool)
+
+        first = {w: self.offsets[w] for w in self.vocab}                        # 1er état de chaque mot
+        last = {w: self.offsets[w] + self.sizes[w] - 1 for w in self.vocab}     # dernier état de chaque mot
+        log_stay_last = np.log1p(-np.exp(self.exit_logp)) if self.exit_logp < 0 else NEG  # log(1 - P(sortie))
+
+        with np.errstate(divide="ignore"):  # log(0) = -inf est voulu (transitions interdites)
+            # 1) Transitions À L'INTÉRIEUR de chaque mot : on recopie la matrice du HMM du mot
+            for w in self.vocab:
+                o, n = self.offsets[w], self.sizes[w]
+                block = np.log(self.wm.models[w].transmat_)
+                # dans le dernier état, on ne reste qu'avec la proba 1 - P(sortie) : le reste part vers le mot suivant
+                block[n - 1, n - 1] = log_stay_last
+                self.logA[o:o + n, o:o + n] = block
+                self.is_final[last[w]] = True
+
+            # 2) Transitions ENTRE mots : fin du mot u -> début du mot v
+            #    score = log P(sortir de u) + lm_weight * log P(v|u) + word_penalty   (_lm fait les 2 derniers termes)
+            for u in self.vocab:
+                for v in self.vocab:
+                    i, j = last[u], first[v]
+                    s = self.exit_logp + self._lm(u, v)
+                    if s > self.logA[i, j]:  # (seulement utile si un mot avait 1 seul état)
+                        self.logA[i, j] = s
+                        self.is_entry[i, j] = True
+
+            # 3) Départ : on commence forcément au début d'un mot v, avec le score du LM P(v | <s>)
+            for v in self.vocab:
+                self.log_start[first[v]] = self._lm("<s>", v)
 
     def emissions(self, feats: np.ndarray) -> np.ndarray:
         """(T, S) log b_s(o_t) concatenated over word models."""
@@ -189,7 +250,37 @@ class WordLoopDecoder:
 
     def decode_emissions(self, B: np.ndarray, drop: tuple = ("sil",)) -> list[str]:
         """Viterbi on precomputed emissions (lets you sweep LM weights without recomputing GMMs)."""
-        raise NotImplementedError("TODO(d1): log-domain Viterbi over the composite HMM, end in a word-final state, backtrack, cut words at entry transitions, drop silence")
+        T, S = B.shape
+        # delta[j] = meilleur score d'un chemin qui arrive dans l'état j à la trame courante
+        # psi[t, j] = d'où venait ce meilleur chemin (la "flèche" pour remonter à la fin)
+        psi = np.zeros((T, S), dtype=np.int64)
+
+        # Trame 0 : score de départ + ressemblance de la trame 0 avec chaque état
+        delta = self.log_start + B[0]
+
+        # Trames suivantes : le tableau du cours, colonne par colonne
+        for t in range(1, T):
+            # cand[i, j] = score si on était en i à t-1 et qu'on passe en j
+            cand = delta[:, None] + self.logA
+            psi[t] = np.argmax(cand, axis=0)                     # meilleur état précédent pour chaque j
+            delta = cand[psi[t], np.arange(S)] + B[t]            # meilleur score + ressemblance de la trame t
+
+        # Fin : on doit finir dans le dernier état d'un mot
+        end_scores = np.where(self.is_final, delta, -np.inf)
+        state = int(np.argmax(end_scores))
+
+        # Remonter les flèches de la dernière trame à la première
+        path = np.empty(T, dtype=np.int64)
+        path[-1] = state
+        for t in range(T - 1, 0, -1):
+            path[t - 1] = psi[t, path[t]]
+
+        # Lire les mots : un nouveau mot commence à t=0 et à chaque transition d'entrée
+        words = [self.word_of_state[path[0]]]
+        for t in range(1, T):
+            if self.is_entry[path[t - 1], path[t]]:
+                words.append(self.word_of_state[path[t]])
+        return [w for w in words if w not in drop]
 
 
 # --------------------------------------------------------------------------- #
@@ -197,4 +288,34 @@ class WordLoopDecoder:
 # --------------------------------------------------------------------------- #
 def train_bigram(sentences: list[list[str]], vocab: list[str], k: float = 0.1,
                  sil_token: str | None = "sil", p_sil: float = 0.15) -> dict:
-    raise NotImplementedError("TODO(d1): add-k bigram P(v|u) with <s>; silence handled as documented; every row must sum to 1")
+    """Bigram add-k : P(v|u) = (count(u v) + k) / (count(u) + k|V|), avec <s> comme mot précédent du 1er mot.
+    Silence : il peut apparaître après n'importe quel mot avec la proba fixe p_sil (les mots se partagent
+    le reste, 1 - p_sil). Le silence ne fait pas partie du texte : après un silence on ne sait plus quel
+    était le mot précédent, donc la ligne 'sil' utilise la distribution unigramme (fréquence de chaque mot)."""
+    from collections import Counter
+    V = len(vocab)
+    pair = Counter()      # pair[(u, v)] = nombre de fois où v suit u
+    hist = Counter()      # hist[u] = nombre de fois où u est suivi d'un mot
+    uni = Counter()       # uni[v] = nombre de fois où v apparaît
+    for s in sentences:
+        prev = "<s>"
+        for w in s:
+            pair[(prev, w)] += 1
+            hist[prev] += 1
+            uni[w] += 1
+            prev = w
+
+    def addk_row(u):  # distribution add-k P(.|u) sur les mots du vocabulaire (somme = 1)
+        return {v: (pair[(u, v)] + k) / (hist[u] + k * V) for v in vocab}
+
+    rows = {u: addk_row(u) for u in ["<s>"] + list(vocab)}
+    if sil_token is None:
+        return rows
+
+    n_uni = sum(uni.values())
+    rows[sil_token] = {v: (uni[v] + k) / (n_uni + k * V) for v in vocab}  # après un silence : unigramme
+    for u, row in rows.items():
+        for v in vocab:
+            row[v] *= 1 - p_sil          # les mots se partagent 1 - p_sil
+        row[sil_token] = p_sil           # le silence prend p_sil  -> la ligne somme toujours à 1
+    return rows
