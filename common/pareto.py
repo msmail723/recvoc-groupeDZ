@@ -20,7 +20,22 @@ def _to_minimisation(values: np.ndarray, directions: list[str]) -> np.ndarray:
 
 def pareto_mask_array(values: np.ndarray, directions: list[str]) -> np.ndarray:
     """True for non-dominated rows. O(n^2), fine for the few hundred configs of a course."""
-    raise NotImplementedError("TODO(d1): return a boolean mask of non-dominated rows (each objective 'min' or 'max'); keep exact duplicates; see test_pareto.py")
+    # 1. Tout convertir en "plus petit = meilleur" (les colonnes 'max' sont multipliées par -1)
+    v = _to_minimisation(np.asarray(values), directions)
+    n = len(v)
+
+    # 2. Au départ, on suppose que personne n'est dominé
+    mask = np.ones(n, dtype=bool)
+
+    # 3. On compare chaque système i à tous les autres systèmes j
+    for i in range(n):
+        for j in range(n):
+            # j domine i si : j est au moins aussi bon partout (<=)
+            #                 ET strictement meilleur sur au moins un critère (<)
+            if np.all(v[j] <= v[i]) and np.any(v[j] < v[i]):
+                mask[i] = False
+                break  # inutile de chercher un autre dominant : i est éliminé
+    return mask
 
 
 def pareto_mask(df, objectives: dict[str, str]) -> np.ndarray:
