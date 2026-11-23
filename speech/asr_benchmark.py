@@ -30,7 +30,82 @@ DEFAULT_MODELS = [
 
 
 def bench_model(model_id, data, batch, device, fp16):
-    raise NotImplementedError("TODO(d2): HF ASR pipeline at the requested batch size and dtype, warm-up, time every batch (sync GPU), return metrics (wer, rtf, latency percentiles, params, energy, memory) and hypotheses")
+    """Benchmark one HF ASR model on `data` (list of dicts audio/sr/text).
+    Returns (metrics, hypotheses). Latency = one call of the pipeline on one batch (batch=1 -> per utterance)."""
+    import torch
+    from transformers import pipeline
+
+    # 1) Choix du matériel et de la précision : fp16 seulement sur GPU (sur CPU c'est lent ou non supporté)
+    use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+    dtype = torch.float16 if (fp16 and use_cuda) else torch.float32
+
+    # 2) Chargement du modèle (chronométré à part : on ne le paie qu'une fois, pas à chaque phrase)
+    t0 = time.perf_counter()
+    asr = pipeline("automatic-speech-recognition", model=model_id, device="cuda:0" if use_cuda else "cpu", dtype=dtype)
+    cuda_sync()
+    load_s = time.perf_counter() - t0
+
+    # Certains tokenizers (ex. Moonshine) n'ont pas de symbole de remplissage (pad) : impossible de traiter un
+    # paquet de phrases de longueurs différentes. Correctif suggéré par transformers : utiliser le symbole de fin (eos).
+    tok = getattr(asr, "tokenizer", None)
+    if batch > 1 and tok is not None and getattr(tok, "pad_token_id", 0) is None:
+        eos = getattr(asr.model.config, "eos_token_id", None) or tok.eos_token_id
+        tok.pad_token_id = eos
+        if getattr(asr.model, "generation_config", None) is not None:
+            asr.model.generation_config.pad_token_id = eos
+
+    # Whisper multilingue : on force l'anglais (sinon il peut détecter une autre langue ou traduire)
+    kw = {}
+    if "whisper" in model_id and not model_id.endswith(".en"):
+        kw["generate_kwargs"] = {"language": "en", "task": "transcribe"}
+
+    # 3) Entrées au format du pipeline, découpées en paquets (batches) de taille `batch`
+    inputs = [{"raw": np.asarray(d["audio"], dtype=np.float32), "sampling_rate": d["sr"]} for d in data]
+    batches = [inputs[i:i + batch] for i in range(0, len(inputs), batch)]
+    audio_s = sum(len(d["audio"]) / d["sr"] for d in data)
+
+    hyps, lats = [], []
+    res: dict = {}
+    # ATTENTION : le pipeline HF modifie les dictionnaires qu'on lui donne (il retire la clé "raw").
+    # On lui passe donc une copie à chaque appel, sinon le 2e passage (après l'échauffement) plante.
+    def fresh(b):
+        return [dict(x) for x in b]
+
+    with torch.inference_mode():
+        # 4) Échauffement : le 1er appel paie l'initialisation (allocation, compilation...) -> non chronométré
+        asr(fresh(batches[0]), batch_size=batch, **kw)
+        cuda_sync()
+        reset_peak_memory()
+        # 5) Mesure : on chronomètre chaque paquet ; cuda_sync() attend la vraie fin du calcul sur GPU
+        with energy_scope(res):
+            for b in batches:
+                b = fresh(b)
+                t1 = time.perf_counter()
+                out = asr(b, batch_size=batch, **kw)
+                cuda_sync()
+                lats.append(time.perf_counter() - t1)
+                hyps.extend(o["text"] for o in out)
+
+    # 6) Les métriques
+    compute_s = float(sum(lats))
+    n_params = sum(p.numel() for p in asr.model.parameters())
+    m = dict(
+        wer=float(wer([d["text"] for d in data], hyps)),       # références et hypothèses normalisées (data.normalise)
+        rtf=compute_s / audio_s,                                # temps de calcul / durée de l'audio
+        throughput_audio_s_per_s=audio_s / compute_s,
+        **summarize_latencies(lats),                            # lat_mean/p50/p90/p99_ms (par paquet)
+        lat_per_utt_mean_ms=compute_s / len(data) * 1000,
+        n_params_M=n_params / 1e6,
+        load_s=load_s,
+        audio_s=audio_s,
+        compute_s=compute_s,
+        device="cuda" if use_cuda else "cpu",
+        dtype="fp16" if dtype == torch.float16 else "fp32",
+        energy_j=res.get("energy_j"),
+        energy_meter=res.get("energy_meter"),
+        **peak_memory_mb(),
+    )
+    return m, hyps
 
 
 def plot(path):

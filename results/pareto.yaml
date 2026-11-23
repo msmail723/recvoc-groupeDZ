@@ -1,7 +1,10 @@
 # Your main Pareto front for the current milestone (update at every tag)
-# d1 : GMM-HMM, chiffres isolés, condition propre (task=gmm_isolated, cfg_split=standard, cfg_condition=clean)
-quality: {column: acc, direction: max}          # précision sur 300 chiffres isolés
-cost:    {column: lat_ms, direction: min}       # temps moyen de reconnaissance par mot (ms) ; le script fourni ne logue pas de p90
-budget:  300                                    # ms : attente acceptable après relâchement du bouton (push-to-talk)
-claimed_front: [S2M1, S2M2, S2M4, S5M4]         # états x mixtures non dominés (voir DECISIONS.md D1)
-chosen: S5M4                                    # meilleure précision, largement sous le budget
+# d2 : modèles neuronaux pré-entraînés, 200 énoncés LibriSpeech test-clean, CPU (task=asr, cfg_milestone=d2)
+quality: {column: wer, direction: min}          # taux d'erreur sur les mots (normalisé)
+cost:    {column: lat_p90_ms, direction: min}   # latence p90 par appel (batch 1 = par énoncé)
+budget:  1000                                   # ms par énoncé (~7 s d'audio en moyenne) : interactif sur laptop CPU
+claimed_front: [facebook/wav2vec2-base-960h, openai/whisper-small.en]   # tous deux en batch 1 (DECISIONS.md D5)
+chosen: facebook/wav2vec2-base-960h            # seul modèle sous le budget ; + 3-gramme possible (D7)
+
+# Historique d1 (GMM-HMM chiffres isolés) : quality=acc/max, cost=lat_ms/min, budget=300,
+# front=[S2M1, S2M2, S2M4, S5M4], chosen=S5M4 (voir DECISIONS.md D1)

@@ -28,7 +28,14 @@ import numpy as np
 
 # --------------------------------------------------------------------------- #
 def greedy_ctc(logprobs: np.ndarray, labels: list[str], blank: int = 0) -> str:
-    raise NotImplementedError("TODO(d2): argmax per frame, collapse repeats, drop blanks, '|' = space")
+    ids = np.argmax(logprobs, axis=1)                       # 1) le symbole le plus probable à chaque trame
+    out, prev = [], None
+    for i in ids:
+        if i != prev and i != blank:                        # 2) fusionner les répétitions, 3) enlever les blanks
+            out.append(labels[i])
+        prev = i                                            #    (un blank entre deux 'l' permet de garder "ll")
+    text = "".join(" " if c == "|" else c for c in out)     # 4) '|' = séparateur de mots
+    return " ".join(text.split())                           # espaces multiples / en bord -> un seul espace
 
 
 def labels_from_processor(processor) -> tuple[list[str], int]:
@@ -82,7 +89,36 @@ def make_decoder(labels, arpa: str | None, alpha: float, beta: float):
 
 def sweep(logprobs_list, refs, labels, blank, arpa, alphas, betas, beams, unigrams=None):
     """Returns rows: decoder, alpha, beta, beam, WER, ms per utterance."""
-    raise NotImplementedError("TODO(d2): rows for greedy, beam without LM (each beam width) and beam + KenLM (alpha x beta x beam): WER and ms per utterance")
+    from speech.data import wer
+    n = len(logprobs_list)
+    rows = []
+
+    def run(name, decode_fn, alpha, beta, beam):
+        t0 = time.perf_counter()
+        hyps = [decode_fn(lp) for lp in logprobs_list]
+        ms = (time.perf_counter() - t0) / n * 1000
+        rows.append(dict(decoder=name, alpha=alpha, beta=beta, beam=beam, wer=float(wer(refs, hyps)), ms_per_utt=ms))
+
+    # 1) Glouton : le modèle acoustique seul (aucune recherche, aucune connaissance des mots)
+    run("greedy", lambda lp: greedy_ctc(lp, labels, blank), None, None, 1)
+
+    # 2) Beam search SANS LM : isole l'effet de la recherche (garder plusieurs hypothèses)
+    dec = make_decoder(labels, None, 0.0, 0.0)
+    for beam in beams:
+        run("beam, no LM", lambda lp, b=beam: dec.decode(lp, beam_width=b), None, None, beam)
+
+    # 3) Beam search + LM n-gramme (KenLM) : isole l'effet de la connaissance de la langue
+    #    score = log P_ctc + alpha * log P_LM + beta * nb_mots   (alpha ~ lambda, beta ~ pénalité du jour 1)
+    if arpa:
+        from pyctcdecode import build_ctcdecoder
+        name = f"beam + LM ({Path(arpa).stem})"
+        dec_lm = build_ctcdecoder(labels, kenlm_model_path=str(arpa), unigrams=unigrams, alpha=alphas[0], beta=betas[0])
+        for alpha in alphas:
+            for beta in betas:
+                dec_lm.reset_params(alpha=alpha, beta=beta)  # on change les poids sans recharger le LM (lent)
+                for beam in beams:
+                    run(name, lambda lp, b=beam: dec_lm.decode(lp, beam_width=b), alpha, beta, beam)
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -154,9 +190,31 @@ def librispeech_logits(root, model_id, n, device):
     return lps, [d["text"].lower() for d in data], labels, blank
 
 
+def plot_ctc(csv_path: Path, out_dir: Path = Path("results/figures")):
+    """Front de Pareto WER vs temps de décodage pour un CSV produit par sweep (ajouté par le groupe)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    from common.pareto import plot_pareto
+    df = pd.read_csv(csv_path)
+    df["label"] = [d if d == "greedy" else (f"beam={b}" if "no LM" in d else f"a={a},b={bb},beam={b}")
+                   for d, a, bb, b in zip(df.decoder, df.alpha, df.beta, df.beam)]
+    df["famille"] = df.decoder.str.replace(r" \(.*\)", "", regex=True)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    plot_pareto(df, "ms_per_utt", "wer", "min", "min", label="label", hue="famille", ax=ax, logx=True,
+                title=f"CTC decoding: WER vs decoding time ({Path(csv_path).stem})", annotate=False)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{Path(csv_path).stem}.png"
+    fig.tight_layout()
+    fig.savefig(out, dpi=130)
+    print("figure ->", out)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--plot", type=Path, help="CSV de résultats à tracer (ex. results/speech_ctc_lm/ctc_lm_wav2vec2-base-100h.csv)")
     ap.add_argument("--librispeech", type=Path)
     ap.add_argument("--model", default="facebook/wav2vec2-base-100h")
     ap.add_argument("--arpa")
@@ -165,6 +223,8 @@ def main():
     ap.add_argument("--out", type=Path, default=Path("results/speech_ctc_lm"))
     ap.add_argument("--jsonl", type=Path, default=Path("results/results.jsonl"))
     args = ap.parse_args()
+    if args.plot:
+        return plot_ctc(args.plot)
     if args.selftest:
         return selftest(args.out)
     import pandas as pd

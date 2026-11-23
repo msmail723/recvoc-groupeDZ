@@ -34,3 +34,27 @@ exam asks you to defend them, including the alternatives you rejected.
 - Evidence: avant correction, `gmm_connected` WER = 1,00 partout (uniquement des suppressions) ; après correction, les résultats de D3, proches de la table du cours (L2).
 - Decision: (c), fonction `_repair_dead_components` dans `speech/gmm_hmm.py`. Une composante de poids 0 ne contribue pas au mélange : on lui donne des valeurs finies en gardant son poids à 0. Le modèle est inchangé et les NaN disparaissent.
 - Would change our mind if: le problème apparaissait aussi sur des modèles de mots (il faudrait alors plus de données, ou moins de mixtures, par état).
+
+## D5 — Modèle neuronal pour le push-to-talk sur laptop : wav2vec2-base-960h   (milestone: d2)
+- Question: parmi les modèles pré-entraînés, lequel déployer pour un usage interactif (une phrase à la fois) sur CPU ?
+- Alternatives: 6 modèles de 4 familles : Whisper (tiny.en 38 M, base.en 73 M, small.en 242 M), distil-Whisper (distil-small.en 166 M), CTC (wav2vec2-base-960h 94 M), Moonshine (moonshine-tiny 27 M).
+- Protocol: les mêmes 200 énoncés LibriSpeech test-clean (22,5 min d'audio, ≤ 20 s), batch 1, CPU de la cloudtop (24 cœurs, fp32), 1 échauffement non chronométré ; WER après normalisation minimale (minuscules, sans ponctuation) ; latence = temps par énoncé, p90.
+- Evidence: `results/figures/asr_bench.png`, lignes `task=asr, cfg_milestone=d2, cfg_batch=1`. WER / p90 / RTF : wav2vec2 3,3 % / 715 ms / 0,06 ; moonshine-tiny 3,6 % / 1155 ms / 0,09 ; whisper-tiny 5,0 % / 1370 ms / 0,13 ; whisper-base 3,7 % / 1742 ms / 0,17 ; distil-small 3,9 % / 2877 ms / 0,32 ; whisper-small 3,1 % / 7413 ms / 0,71. Front de Pareto (WER, p90) = {wav2vec2-base-960h, whisper-small.en}.
+- Decision: wav2vec2-base-960h. C'est le seul modèle sous notre budget (p90 ≤ 1000 ms sur des phrases de ~7 s), avec un WER au niveau des meilleurs. Il est aussi le seul auquel on peut ajouter un LM externe (D7).
+- Would change our mind if: les écarts de WER entre 3,1 et 3,7 % ne sont **pas significatifs** sur 200 phrases (il faudrait un bootstrap apparié). Notre normaliseur pénalise Whisper (il écrit « 20 », « Mr. »…), donc son WER est surestimé. Si la mémoire comptait (27 M contre 94 M), moonshine-tiny serait le choix. Whisper-small ne serait choisi que pour du hors-ligne : sa RTF de 0,71 donne ~3,5 s d'attente pour une commande de 5 s.
+
+## D6 — Pas de batch 16 sur CPU (et jamais avec wav2vec2-base)   (milestone: d2)
+- Question: traiter 16 phrases à la fois (débit) est-il intéressant sur notre machine ?
+- Alternatives: batch 1 vs batch 16, pour les 6 modèles.
+- Protocol: comme D5 ; RTF = temps total de calcul / durée totale de l'audio.
+- Evidence: lignes `task=asr, cfg_milestone=d2`. Sur CPU, le batch 16 est **plus lent** pour tous les modèles (RTF tiny 0,13 → 0,24 ; small 0,71 → 1,22 ; moonshine 0,09 → 0,18 ; wav2vec2 0,06 → 0,11). Pour wav2vec2-base, le WER explose : 3,3 % → 24,5 %. Diagnostic : son extracteur n'utilise pas de masque d'attention (`return_attention_mask=False`), donc le silence ajouté pour égaliser les longueurs du paquet perturbe la reconnaissance. Sur 16 phrases, la plus courte (2,7 s) est parfaitement reconnue seule et donne une transcription **vide** en batch.
+- Decision: batch 1 partout sur cette machine, y compris pour du hors-ligne. Pas de batch avec les modèles sans masque d'attention.
+- Would change our mind if: on disposait d'un GPU, où le batch remplit les unités de calcul. **Limite** : Ma cloudtop que j'utilisee n'a pas de GPU, la comparaison CPU/GPU et fp16/fp32 n'a pas été mesurée.
+
+## D7 — LM explicite pour CTC : beam 10 + 3-gramme, α = 0,5, β = 1   (milestone: d2)
+- Question: qu'apporte un LM n-gramme externe à un modèle CTC, à quel coût, et avec quels réglages ?
+- Alternatives: glouton ; beam sans LM (10, 50, 100) ; beam + 3-gramme LibriSpeech élagué × α ∈ {0,3 ; 0,5 ; 1 ; 2} × β ∈ {0 ; 1 ; 2} × beam ∈ {10, 50, 100}.
+- Protocol: wav2vec2-base-100h (modèle acoustique volontairement plus faible, 100 h de données étiquetées), 200 énoncés test-clean, log-probabilités calculées une fois puis décodées par pyctcdecode + KenLM sur CPU ; temps = décodage seul, par énoncé.
+- Evidence: `results/figures/ctc_lm_wav2vec2-base-100h.png`, `results/speech_ctc_lm/ctc_lm_wav2vec2-base-100h.csv`, lignes `task=ctc_decoding, cfg_milestone=d2`. Glouton 6,0 % (0,08 ms) ; beam sans LM 6,2 % (10-19 ms), donc **aucun gain** de la recherche seule ; beam + 3-gramme **3,7 %** (α = 0,5, β = 1, beam = 10, 8 ms), soit −39 % d'erreurs relatives. α = 2 dégrade (6,5-7,7 %) : le LM « écrase » l'acoustique, comme λ = 64 au jour 1. Beam 50 ou 100 n'apportent rien de plus.
+- Decision: beam = 10, α = 0,5, β = 1. Le coût (~8 ms par phrase) est négligeable devant le modèle acoustique. Comparaison explicite / implicite : CTC + 3-gramme atteint un WER proche de whisper-small (3,1 %) pour une fraction du calcul, et le LM se change en ré-entraînant un n-gramme sur du texte du domaine.
+- Would change our mind if: α et β ont été choisis **sur les mêmes 200 phrases** que celles où on rapporte le WER (pas de séparation dev/test), donc 3,7 % est optimiste. À valider sur d'autres phrases (test-other ou un autre tirage). Les écarts entre les meilleurs réglages (3,7-3,8 %) sont dans le bruit. Le 4-gramme n'a pas été testé (1,3 Go).
