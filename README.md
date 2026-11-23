@@ -1,3 +1,24 @@
+# Groupe DZ — Projet S (reconnaissance vocale)
+
+## Membres et contributions
+| Membre            | Contributions |
+| Massinissa SMAIL  |   À COMPLÉTER |
+| Sofia ZABOUR      |   À COMPLÉTER |
+| Reda HADDADI      |   À COMPLÉTER |
+
+## Lancer le projet
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pip install --no-deps pyctcdecode && pip install pygtrie https://github.com/kpu/kenlm/archive/master.zip
+bash scripts/fetch_data.sh data
+pytest -m "d1 or d2"
+```
+Jour 1 : `python -m speech.run_classical_baseline --fsdd data/fsdd/recordings --part {isolated,lm,connected,plot}`.
+Décisions : `DECISIONS.md`. Résultats : `results/results.jsonl`, `results/figures/`, `results/pareto.yaml`.
+
+---
+
 # M2 ISD 26-27 — Data science — Projet S
 
 Ce dépôt est le matériel étudiant du M2 ISD 26-27, Data science, Projet S (reconnaissance de la parole).
