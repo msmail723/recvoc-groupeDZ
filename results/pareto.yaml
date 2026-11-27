@@ -2,12 +2,12 @@
 # d3: streaming push-to-talk, 20 LibriSpeech test-clean utterances, cloudtop CPU (task=asr_streaming, cfg_milestone=d3)
 quality: {column: wer_stream, direction: min}   # WER of the committed text
 cost:    {column: finish_p50, direction: min}   # median wait after release, in seconds
-budget:  0.25                                   # seconds (DECISIONS.md D8)
+budget:  0.25                                   # seconds (DECISIONS.md D5)
 claimed_front: [reference/fastconformer-114M-int8, student/w2v2-960h+3gram, student/zipformer-20M+lead1s]
-                                                # student/w2v2-960h+3gram: the step 2 s row only (DECISIONS.md D9)
+                                                # student/w2v2-960h+3gram: the step 2 s row only (DECISIONS.md D5)
 chosen: reference/fastconformer-114M-int8       # best WER under the budget, lowest commit lag
 
 # History
 # d2: quality=wer/min, cost=lat_p90_ms/min, budget=1000 ms, front=[facebook/wav2vec2-base-960h, openai/whisper-small.en],
-#     chosen=facebook/wav2vec2-base-960h (DECISIONS.md D5)
+#     chosen=facebook/wav2vec2-base-960h (DECISIONS.md D3)
 # d1: quality=acc/max, cost=lat_ms/min, budget=300 ms, front=[S2M1, S2M2, S2M4, S5M4], chosen=S5M4 (DECISIONS.md D1)

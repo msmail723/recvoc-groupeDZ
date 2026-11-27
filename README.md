@@ -20,7 +20,7 @@ bash run_smoke.sh                                 # mini-pipeline de bout en bou
 - **Jour 1** : `python -m speech.run_classical_baseline --fsdd data/fsdd/recordings --part {isolated,lm,connected,plot}`
 - **Jour 2** : `python -m speech.asr_benchmark --librispeech data/LibriSpeech --device cpu --batch 1 16 --models ...` ; `python -m speech.ctc_lm --librispeech data/LibriSpeech --model facebook/wav2vec2-base-100h --arpa data/lm/3-gram.pruned.1e-7.arpa --device cpu`
 - **Jour 3** : `python -m speech.streaming_sim` (7 lignes), puis `--models student/ctc+3gram student/w2v2-960h+3gram student/zipformer-20M+lead1s reference/zipformer-20M-int8` ; `python -m asr_demo.replay --librispeech data/LibriSpeech --n 8 --realtime --backends ...` ; démo live : `python -m asr_demo.server` puis http://localhost:8000
-- Nos systèmes de la démo : `my_backends.py`. Décisions : `DECISIONS.md` (D1 à D9). Résultats : `results/results.jsonl`, `results/figures/`, `results/pareto.yaml`.
+- Nos systèmes de la démo : `my_backends.py`. Décisions : `DECISIONS.md` (D1 à D5). Résultats : `results/results.jsonl`, `results/figures/`, `results/pareto.yaml`.
 - Machine des mesures : cloudtop Linux, Intel Xeon 2,2 GHz, 24 vCPU, sans GPU.
 
 ---
