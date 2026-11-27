@@ -1,10 +1,13 @@
 # Your main Pareto front for the current milestone (update at every tag)
-# d2 : modèles neuronaux pré-entraînés, 200 énoncés LibriSpeech test-clean, CPU (task=asr, cfg_milestone=d2)
-quality: {column: wer, direction: min}          # taux d'erreur sur les mots (normalisé)
-cost:    {column: lat_p90_ms, direction: min}   # latence p90 par appel (batch 1 = par énoncé)
-budget:  1000                                   # ms par énoncé (~7 s d'audio en moyenne) : interactif sur laptop CPU
-claimed_front: [facebook/wav2vec2-base-960h, openai/whisper-small.en]   # tous deux en batch 1 (DECISIONS.md D5)
-chosen: facebook/wav2vec2-base-960h            # seul modèle sous le budget ; + 3-gramme possible (D7)
+# d3: streaming push-to-talk, 20 LibriSpeech test-clean utterances, cloudtop CPU (task=asr_streaming, cfg_milestone=d3)
+quality: {column: wer_stream, direction: min}   # WER of the committed text
+cost:    {column: finish_p50, direction: min}   # median wait after release, in seconds
+budget:  0.25                                   # seconds (DECISIONS.md D8)
+claimed_front: [reference/fastconformer-114M-int8, student/w2v2-960h+3gram, student/zipformer-20M+lead1s]
+                                                # student/w2v2-960h+3gram: the step 2 s row only (DECISIONS.md D9)
+chosen: reference/fastconformer-114M-int8       # best WER under the budget, lowest commit lag
 
-# Historique d1 (GMM-HMM chiffres isolés) : quality=acc/max, cost=lat_ms/min, budget=300,
-# front=[S2M1, S2M2, S2M4, S5M4], chosen=S5M4 (voir DECISIONS.md D1)
+# History
+# d2: quality=wer/min, cost=lat_p90_ms/min, budget=1000 ms, front=[facebook/wav2vec2-base-960h, openai/whisper-small.en],
+#     chosen=facebook/wav2vec2-base-960h (DECISIONS.md D5)
+# d1: quality=acc/max, cost=lat_ms/min, budget=300 ms, front=[S2M1, S2M2, S2M4, S5M4], chosen=S5M4 (DECISIONS.md D1)

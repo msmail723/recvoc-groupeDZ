@@ -1,17 +1,34 @@
-"""Register YOUR systems here: they appear in the demo's backend list (python -m asr_demo.server).
-Same contract as the provided ones (asr_demo/contract.py). Uncomment and adapt."""
-# import numpy as np
-# from asr_demo.backends import register, get
-# from asr_demo.contract import OfflineBackend
-#
-# @register("student/ctc+3gram", "wav2vec2-base-100h + our KenLM decoder (alpha=0.5, beta=1.0)")
-# class CTCWithLM(OfflineBackend):
-#     def __init__(self):
-#         ...                                   # load the model and build the decoder ONCE
-#     def transcribe(self, audio: np.ndarray) -> str:
-#         ...                                   # 16 kHz float32 in, lower-case words out
-#
-# A streaming wrapper around any registered offline backend (your day-3 policy):
-# from speech.streaming_live import LocalAgreementBackend
-# register("student/local-agreement(ctc+3gram)", "our LocalAgreement-2, 1 s step")(
-#     lambda: LocalAgreementBackend(get("student/ctc+3gram"), step_s=1.0))
+"""Register YOUR systems here: they appear in the demo's backend list (python -m asr_demo.server), in
+`python -m asr_demo.replay --backends ...` and in `python -m speech.streaming_sim --models ...`.
+Same contract as the provided ones (asr_demo/contract.py). Lecture L6, "Hijack the demo".
+
+Group DZ systems (see DECISIONS.md):
+  * student/ctc+3gram                 our day-2 decoder (D7): wav2vec2-base-100h + pruned 3-gram,
+                                      alpha=0.5, beta=1, N_beam=10
+  * student/w2v2-960h+3gram           our day-2 acoustic model choice (D5, wav2vec2-base-960h) with the same
+                                      3-gram and the same (alpha, beta, N_beam), tuned on base-100h
+  * student/local-agreement(...)      our day-3 streaming policy (LocalAgreement-2, 0.5 s step) around each
+  * student/zipformer-20M+lead1s      the small streaming transducer with 1 s of silence first (L6, slide 8)
+"""
+from asr_demo.backends import CTCWithLM, SherpaTransducer, ZIPFORMER_20M, get, register
+from speech.streaming_live import LocalAgreementBackend
+
+ARPA = "lm/3-gram.pruned.1e-7.arpa"
+
+# 1. Our day-2 decoder, with the values our sweep chose (DECISIONS.md, D7)
+register("student/ctc+3gram", "wav2vec2-base-100h + 3-gram, our d2 choice (alpha=0.5, beta=1, N_beam=10)")(
+    lambda: CTCWithLM("facebook/wav2vec2-base-100h", ARPA, alpha=0.5, beta=1.0, beam=10))
+
+# 2. Our day-2 acoustic model (D5) with the same LM settings
+register("student/w2v2-960h+3gram", "wav2vec2-base-960h + 3-gram (alpha=0.5, beta=1, N_beam=10)")(
+    lambda: CTCWithLM("facebook/wav2vec2-base-960h", ARPA, alpha=0.5, beta=1.0, beam=10))
+
+# 3. Our day-3 streaming policy around them (speech/streaming_live.py)
+register("student/local-agreement(ctc+3gram)", "LocalAgreement-2, 0.5 s step, around student/ctc+3gram")(
+    lambda: LocalAgreementBackend(get("student/ctc+3gram"), step_s=0.5))
+register("student/local-agreement(w2v2-960h+3gram)", "LocalAgreement-2, 0.5 s step, around student/w2v2-960h+3gram")(
+    lambda: LocalAgreementBackend(get("student/w2v2-960h+3gram"), step_s=0.5))
+
+# 4. The small streaming transducer with silence before the speech (it loses first words without it)
+register("student/zipformer-20M+lead1s", "20M zipformer, 1 s of silence first")(
+    lambda: SherpaTransducer(ZIPFORMER_20M, int8=True, lead_s=1.0))

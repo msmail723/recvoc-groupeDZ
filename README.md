@@ -1,21 +1,27 @@
 # Groupe DZ — Projet S (reconnaissance vocale)
 
 ## Membres et contributions
-| Membre            | Contributions |
-| Massinissa SMAIL  |   À COMPLÉTER |
-| Sofia ZABOUR      |   À COMPLÉTER |
-| Reda HADDADI      |   À COMPLÉTER |
+| Membre | Contributions |
+|---|---|
+| Massinissa SMAIL | À COMPLÉTER |
+| Sofia ZABOUR | À COMPLÉTER |
+| Reda HADDADI | À COMPLÉTER |
 
 ## Lancer le projet
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-pip install --no-deps pyctcdecode && pip install pygtrie https://github.com/kpu/kenlm/archive/master.zip
-bash scripts/fetch_data.sh data
-pytest -m "d1 or d2"
+pip install "uvicorn[standard]" hypothesis pygtrie
+pip install --no-deps pyctcdecode && pip install https://github.com/kpu/kenlm/archive/master.zip
+python scripts/fetch_data.py                      # FSDD, LibriSpeech test-clean, 3-gram, modèles de la démo
+pytest -m "d1 or d2 or d3 or stretch"             # 31 tests
+bash run_smoke.sh                                 # mini-pipeline de bout en bout, < 10 min (sorties dans results/smoke/)
 ```
-Jour 1 : `python -m speech.run_classical_baseline --fsdd data/fsdd/recordings --part {isolated,lm,connected,plot}`.
-Décisions : `DECISIONS.md`. Résultats : `results/results.jsonl`, `results/figures/`, `results/pareto.yaml`.
+- **Jour 1** : `python -m speech.run_classical_baseline --fsdd data/fsdd/recordings --part {isolated,lm,connected,plot}`
+- **Jour 2** : `python -m speech.asr_benchmark --librispeech data/LibriSpeech --device cpu --batch 1 16 --models ...` ; `python -m speech.ctc_lm --librispeech data/LibriSpeech --model facebook/wav2vec2-base-100h --arpa data/lm/3-gram.pruned.1e-7.arpa --device cpu`
+- **Jour 3** : `python -m speech.streaming_sim` (7 lignes), puis `--models student/ctc+3gram student/w2v2-960h+3gram student/zipformer-20M+lead1s reference/zipformer-20M-int8` ; `python -m asr_demo.replay --librispeech data/LibriSpeech --n 8 --realtime --backends ...` ; démo live : `python -m asr_demo.server` puis http://localhost:8000
+- Nos systèmes de la démo : `my_backends.py`. Décisions : `DECISIONS.md` (D1 à D9). Résultats : `results/results.jsonl`, `results/figures/`, `results/pareto.yaml`.
+- Machine des mesures : cloudtop Linux, Intel Xeon 2,2 GHz, 24 vCPU, sans GPU.
 
 ---
 

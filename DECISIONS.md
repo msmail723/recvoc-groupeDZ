@@ -58,3 +58,54 @@ exam asks you to defend them, including the alternatives you rejected.
 - Evidence: `results/figures/ctc_lm_wav2vec2-base-100h.png`, `results/speech_ctc_lm/ctc_lm_wav2vec2-base-100h.csv`, lignes `task=ctc_decoding, cfg_milestone=d2`. Glouton 6,0 % (0,08 ms) ; beam sans LM 6,2 % (10-19 ms), donc **aucun gain** de la recherche seule ; beam + 3-gramme **3,7 %** (α = 0,5, β = 1, beam = 10, 8 ms), soit −39 % d'erreurs relatives. α = 2 dégrade (6,5-7,7 %) : le LM « écrase » l'acoustique, comme λ = 64 au jour 1. Beam 50 ou 100 n'apportent rien de plus.
 - Decision: beam = 10, α = 0,5, β = 1. Le coût (~8 ms par phrase) est négligeable devant le modèle acoustique. Comparaison explicite / implicite : CTC + 3-gramme atteint un WER proche de whisper-small (3,1 %) pour une fraction du calcul, et le LM se change en ré-entraînant un n-gramme sur du texte du domaine.
 - Would change our mind if: α et β ont été choisis **sur les mêmes 200 phrases** que celles où on rapporte le WER (pas de séparation dev/test), donc 3,7 % est optimiste. À valider sur d'autres phrases (test-other ou un autre tirage). Les écarts entre les meilleurs réglages (3,7-3,8 %) sont dans le bruit. Le 4-gramme n'a pas été testé (1,3 Go).
+
+## D8 — Budget push-to-talk : attente médiane après relâchement ≤ 0,25 s   (milestone: d3)
+- Question: combien de temps l'utilisateur peut-il attendre entre le relâchement du bouton et le texte final, et quelle colonne mesure ce coût ?
+- Alternatives: budget sur `finish_p50` (attente médiane après relâchement), sur `lag_p50` (retard médian des mots validés pendant qu'on parle) ou sur `rtf` ; limites de 0,2 s (l'exemple du cours), 0,25 s et 0,5 s.
+- Protocol: cas d'usage = commandes vocales courtes (2-5 s, « mets un minuteur de dix minutes »). C'est le texte final qui est exécuté ; les partiels affichés pendant qu'on parle sont un confort. Dans une conversation humaine, les silences entre deux tours de parole durent environ 0,2-0,3 s : au-delà, l'assistant semble « réfléchir ».
+- Evidence: `results/streaming.csv`, `results/figures/streaming_pareto.png`, lignes `task=asr_streaming, cfg_milestone=d3` (15 lignes, 20 énoncés LibriSpeech test-clean, CPU de la cloudtop : Intel Xeon 2,2 GHz, 24 vCPU). `finish_p50` va de 0,029 s (transducteurs zipformer) à 1,080 s (Whisper tiny re-décodé toutes les 0,5 s).
+- Decision: coût = `finish_p50`, budget = 0,25 s ; qualité = `wer_stream` (WER du texte validé). `lag_p50` sert de critère secondaire : un mot validé ne devrait pas apparaître plus d'environ 1 s après avoir été prononcé.
+- Would change our mind if: les requêtes étaient de longues dictées (20 s), où le retard pendant la parole compte plus que l'attente finale ; ou si la machine de démo était plus rapide (sur le Mac du prof, l'attente de la référence tombe à 43 ms ; sur notre cloudtop elle est de 205 ms, si bien qu'un budget de 0,2 s l'exclurait à 5 ms près).
+
+## D9 — Système déployé : le transducteur streaming fastconformer (reference/fastconformer-114M-int8)   (milestone: d3)
+- Question: quel système déployer pour la démo push-to-talk sous le budget D8, et que prédit-on avant de l'essayer ?
+- Alternatives: 15 configurations streaming :
+  - Whisper tiny, wav2vec2-base-960h, notre `student/ctc+3gram` (D7) et notre `student/w2v2-960h+3gram`, chacun re-décodé avec notre LocalAgreement-2 à un pas de 0,5, 1 ou 2 s ;
+  - les transducteurs nativement streaming : fastconformer-114M, zipformer-20M et notre `student/zipformer-20M+lead1s` (1 s de silence au début).
+- Protocol:
+  - `python -m speech.streaming_sim` (configurations par défaut + `--models` pour nos systèmes), 20 énoncés (137 s d'audio, 383 mots), même horloge simulée et mêmes fins de mots (alignement forcé) pour tous les systèmes ;
+  - puis `python -m asr_demo.replay --librispeech data/LibriSpeech --n 8 --realtime` sur 6 candidats : l'audio est envoyé à vitesse réelle par morceaux de 100 ms, comme le fait le navigateur ;
+  - tout sur le CPU de la cloudtop, sans autre programme lourd.
+- Evidence:
+  - Front (`wer_stream` ↓, `finish_p50` ↓), calculé avec notre `pareto_mask` sur les 15 lignes d3 : fastconformer (WER 0,021, attente 0,205 s, retard p50 0,68 s), `student/w2v2-960h+3gram` au pas de 2 s (0,018 ; 0,267 s ; retard p50 2,90 s), `student/zipformer-20M+lead1s` (0,091 ; 0,029 s). Toutes les autres configurations sont dominées.
+  - Sous le budget de 0,25 s, il ne reste que le fastconformer et le zipformer+lead1s. Le fastconformer fait 4× moins d'erreurs et a le plus petit retard de validation de tous les systèmes (p50 0,68 s, p90 0,87 s).
+  - Replay (lignes `task=demo_replay, cfg_milestone=d3`, moyennes sur 8 enregistrements de 2,7 à 12,8 s) :
+    - fastconformer : premier partiel 1,05 s, attente 205 ms, RTF 0,38 ;
+    - notre `student/local-agreement(w2v2-960h+3gram)` : premier partiel 0,69 s, attente 458 ms ;
+    - wav2vec2-960h + 3-gramme hors ligne : aucun partiel, attente 375 ms ;
+    - Whisper tiny hors ligne : attente 819 ms.
+  - Autres constats :
+    - la seconde de silence au début fait passer le WER du petit zipformer de 0,253 à 0,091 (sans elle, il perd les premiers mots, cours L6) ;
+    - le n-gramme qui valide trop tôt perd le contexte de droite : `student/ctc+3gram` fait 0,037 en streaming au pas de 0,5 s, contre 0,023 hors ligne ;
+    - le modèle 960h garde 0,023 à tous les pas.
+- Decision: déployer reference/fastconformer-114M-int8. **Prédiction pour la démo**, écrite avant de l'essayer :
+  - premier partiel ≈ 1,0 s après le début de la parole ;
+  - attente après relâchement ≈ 0,2 s, **constante quelle que soit la longueur de la requête** (en streaming, il ne reste que le dernier morceau et un flush à traiter) ;
+  - WER plus élevé que sur LibriSpeech (0,021), autour de 5-15 % sur nos propres voix (accent non natif, micro d'ordinateur, pas de LM externe).
+
+  À comparer avec notre `student/local-agreement(w2v2-960h+3gram)` re-décodé : premier partiel ≈ 0,7 s, mais une attente qui **augmente avec la longueur de la requête** (≈ 0,3 s pour 3 s de parole, ≈ 0,5 s pour 10 s), car la passe finale décode tout le buffer.
+- Would change our mind if:
+  - l'écart de WER n'est pas significatif : 2,1 % contre 1,8 %, soit 8 contre 7 erreurs sur 383 mots, très en dessous du bruit de 20 énoncés (il faudrait un bootstrap apparié, cours L5) ;
+  - une machine de démo plus rapide faisait passer notre `w2v2-960h+3gram` sous 0,25 s au pas de 0,5 s (0,138 s sur le Mac du prof) : le choix se ferait alors sur le WER et sur les partiels ;
+  - la démo montrait des premiers mots perdus ou une forte pénalité d'accent pour le transducteur.
+- Vérification de la prédiction (replay temps réel, 8 enregistrements LibriSpeech, lignes `task=demo_replay, cfg_milestone=d3`, droite des moindres carrés « attente en fonction de la durée » sur les 8 enregistrements de chaque système) :
+  - **premier partiel** : prédit ≈ 1,0 s, mesuré **1,05 s** en moyenne → **vérifié** ;
+  - **attente après relâchement** : prédit ≈ 0,2 s et constante, mesuré **206 ms + 0,0 ms par seconde d'audio** (de 182 à 224 ms, pour des enregistrements de 2,7 à 12,8 s) → **vérifié** : l'attente du transducteur ne dépend pas de la longueur ;
+  - **système re-décodé de comparaison** : mesuré 68 ms + 49 ms par seconde d'audio, soit ≈ 0,22 s pour 3 s et ≈ 0,56 s pour 10 s → la tendance prédite (une attente qui grandit avec la longueur) est **vérifiée**. Notre prédiction était trop pessimiste pour les requêtes courtes (0,22 s au lieu de 0,3 s) et un peu optimiste pour les longues (0,56 s au lieu de 0,5 s) ;
+  - **WER sur nos voix** : le replay utilise des voix LibriSpeech (WER moyen par enregistrement 0,053 sur ces 8 enregistrements) ; nos voix sont mesurées par la démo live ci-dessous.
+- Démo live (micro d'ordinateur → navigateur → serveur sur la cloudtop via la redirection de port de VS Code ; lignes `task=demo, cfg_milestone=d3`, enregistrements dans `results/demo_recordings/`) : 5 phrases en anglais (commandes de 4,5 à 9,1 s, bouton compris), plus 1 essai en français.
+  - **WER** : 4 erreurs sur 52 mots = **7,7 %** → dans la fourchette prédite (5-15 %) → **vérifié**. Les erreurs sont surtout en **début de phrase** (« turn on » entendu « trunn » ou « then on », 2 fois sur 2) et sur un mot (« speech » → « speaker »). C'est une version atténuée du phénomène « premiers mots perdus » du cours L6.
+  - **Premier partiel** : la page affiche 1,87 à 2,46 s, ce qui semble contredire la prédiction (1,0 s). Mais il est mesuré **depuis l'appui sur le bouton**, et nos enregistrements commencent par 0,74 à 1,46 s de silence avant la parole (mesuré sur les fichiers `.wav`, seuil d'énergie à −30 dB du maximum). **Mesuré depuis le début de la parole** : 0,77 à 1,40 s, **1,03 s en moyenne** → la prédiction est **vérifiée**. Ce métrique dépend donc aussi de l'utilisateur, pas seulement du modèle.
+  - **Attente après relâchement** : 208 à 289 ms (médiane 267 ms), **sans lien avec la longueur** (260 ms pour la phrase de 9,1 s) → la forme prédite (constante) est **vérifiée**, mais le niveau est **plus haut d'environ 60 ms** que le replay (205 ms) et **dépasse notre budget de 0,25 s** sur 4 phrases sur 5. Explication probable (non mesurée séparément) : en live, l'audio et le texte final passent par le navigateur, une WebSocket et le tunnel réseau entre l'ordinateur et la cloudtop, alors que le replay tourne dans le même processus que le modèle. Le RTF est aussi un peu plus haut en live (0,45 contre 0,38).
+  - **Essai en français** (« Bonjour, j'adore le module de reconnaissance vocale ») : WER = 1,00. Le modèle n'a appris que l'anglais : il « entend » des mots anglais. C'est une limite à montrer à l'oral (une langue hors du domaine d'entraînement).
+  - **Conséquence sur la décision** : on garde le fastconformer. Le dépassement du budget vient du chemin réseau de notre démo, pas du modèle (205 ms dans le même processus), et disparaîtrait avec le serveur sur l'ordinateur lui-même, comme le prévoit le cours. Le seul système toujours sous le budget (zipformer + 1 s, 29 ms) fait environ 4× plus d'erreurs (9,1 % contre 2,1 % sur les 20 énoncés). 5 phrases, c'est peu : ces chiffres de démo illustrent, ils ne prouvent pas.

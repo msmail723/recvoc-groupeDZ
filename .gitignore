@@ -4,3 +4,9 @@ __pycache__/
 *.pyc
 models/
 *.pkl
+results/librispeech_wavs/
+results/demo_recordings/
+.pytest_cache/
+.ipynb_checkpoints/
+.agents/
+results/smoke/

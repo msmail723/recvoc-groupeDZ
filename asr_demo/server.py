@@ -6,7 +6,7 @@ Protocol (one WebSocket per recording, backend chosen per recording):
   client -> {"type":"start","backend":NAME,"reference":optional text}
   client -> binary chunks: float32 mono 16 kHz, ~100 ms each, while the record button is down
   client -> {"type":"stop"}
-  server -> {"type":"loading"} (first use of a backend) · {"type":"partial","text","t_ms"} · {"type":"final",...metrics}
+  server -> {"type":"loading"} (first use of a backend; the page also preloads it via POST /api/load on selection) · {"type":"partial","text","t_ms"} · {"type":"final",...metrics}
 Every request is logged to results/results.jsonl (task demo) and its audio saved for replay on other backends.
 """
 from __future__ import annotations
@@ -46,9 +46,10 @@ def list_backends():
 
 
 def _log(m: dict, mode: str):
+    task = "demo" if mode == "live" else "demo_replay"
     cfg = {"mode": mode, "streaming": m.get("streaming"), "recording": m.get("recording")}
     keep = {k: v for k, v in m.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
-    log_record(BenchRecord("demo", m["backend"], cfg, keep), LOG)
+    log_record(BenchRecord(task, m["backend"], cfg, keep), LOG)
 
 
 @app.websocket("/ws")
@@ -72,44 +73,99 @@ async def ws_endpoint(ws: WebSocket):
         load_ms = (time.perf_counter() - t_load) * 1000
         session = backend.new_session()
         audio, compute, t0, first_partial, n_partials = [], 0.0, None, None, 0
-        while True:
-            msg = await ws.receive()
-            if msg.get("bytes") is not None:
-                chunk = np.frombuffer(msg["bytes"], dtype=np.float32).copy()
-                t0 = t0 or time.perf_counter()
-                audio.append(chunk)
-                c0 = time.perf_counter()
-                text = await asyncio.to_thread(session.accept_chunk, chunk)
-                compute += time.perf_counter() - c0
-                if text:
-                    n_partials += 1
-                    first_partial = first_partial or (time.perf_counter() - t0) * 1000
-                    await ws.send_json({"type": "partial", "text": text, "t_ms": (time.perf_counter() - t0) * 1000})
-            elif msg.get("text") is not None and json.loads(msg["text"]).get("type") == "stop":
-                t_stop = time.perf_counter()
-                final = await asyncio.to_thread(session.finish)
-                done = time.perf_counter()
-                compute += done - t_stop
-                y = np.concatenate(audio) if audio else np.zeros(0, np.float32)
-                rid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
-                REC.mkdir(parents=True, exist_ok=True)
-                sf.write(REC / f"{rid}.wav", y, 16000)
-                if reference:
-                    (REC / f"{rid}.txt").write_text(reference)
-                m = summarise(name, backend.streaming, y, 16000, compute, first_partial, (done - t_stop) * 1000,
-                              n_partials, final, reference, load_ms)
-                m["recording"] = rid
-                _log(m, "live")
-                await ws.send_json({"type": "final", **m})
-                return
-            elif msg.get("type") == "websocket.disconnect":
-                return
+        q: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+
+        async def reader():
+            nonlocal t0
+            try:
+                while True:
+                    msg = await ws.receive()
+                    if msg.get("bytes") is not None:
+                        chunk = np.frombuffer(msg["bytes"], dtype=np.float32).copy()
+                        if t0 is None:
+                            t0 = time.perf_counter() - len(chunk) / 16000
+                        await q.put(("chunk", chunk))
+                    elif msg.get("text") is not None and json.loads(msg["text"]).get("type") == "stop":
+                        await q.put(("stop", time.perf_counter()))
+                        return
+                    elif msg.get("type") == "websocket.disconnect":
+                        await q.put(("disconnect", None))
+                        return
+            except WebSocketDisconnect:
+                await q.put(("disconnect", None))
+            except Exception as e:
+                await q.put(("error", e))
+
+        reader_task = asyncio.create_task(reader())
+        try:
+            while True:
+                kind, payload = await q.get()
+                if kind == "chunk":
+                    chunk = payload
+                    audio.append(chunk)
+                    c0 = time.perf_counter()
+                    text = await asyncio.to_thread(session.accept_chunk, chunk)
+                    compute += time.perf_counter() - c0
+                    if text:
+                        n_partials += 1
+                        now_ms = (time.perf_counter() - t0) * 1000
+                        first_partial = first_partial or now_ms
+                        await ws.send_json({"type": "partial", "text": text, "t_ms": now_ms})
+                elif kind == "stop":
+                    t_stop = payload
+                    c0 = time.perf_counter()
+                    final = await asyncio.to_thread(session.finish)
+                    done = time.perf_counter()
+                    compute += done - c0
+                    y = np.concatenate(audio) if audio else np.zeros(0, np.float32)
+                    rid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+                    REC.mkdir(parents=True, exist_ok=True)
+                    sf.write(REC / f"{rid}.wav", y, 16000)
+                    if reference:
+                        (REC / f"{rid}.txt").write_text(reference, encoding="utf-8")
+                    m = summarise(name, backend.streaming, y, 16000, compute, first_partial, (done - t_stop) * 1000,
+                                  n_partials, final, reference, load_ms)
+                    m["recording"] = rid
+                    _log(m, "live")
+                    await ws.send_json({"type": "final", **m})
+                    return
+                elif kind == "disconnect":
+                    return
+                elif kind == "error":
+                    raise payload
+        finally:
+            reader_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reader_task
     except WebSocketDisconnect:
         return
     except Exception as e:  # tell the browser why, instead of silently dropping the socket
         traceback.print_exc()
         with contextlib.suppress(Exception):
             await ws.send_json({"type": "error", "message": f"{name}: {backends.explain(e)}" if name else backends.explain(e)})
+    finally:  # a proper close: returning without one drops the TCP connection, and the browser may lose our last message
+        with contextlib.suppress(Exception):
+            await ws.close()
+
+
+class LoadRequest(BaseModel):
+    backend: str
+
+
+@app.post("/api/load")
+async def load(req: LoadRequest):
+    """Load a backend as soon as it is selected, so the first recording does not wait (and a stub is reported now)."""
+    try:
+        await asyncio.to_thread(backends.get, req.backend)
+    except backends.BackendUnavailable as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"loaded": True}
+
+
+@app.get("/api/prompt")
+def prompt(backend: str):
+    """A sentence suited to this backend (digits for the day-1 entries), or null: the page then uses its own list."""
+    return {"text": backends.prompt(backend)}
 
 
 class ReplayRequest(BaseModel):
@@ -123,7 +179,7 @@ async def replay(req: ReplayRequest):
     """Same saved audio, another backend: the only fair way to compare backends qualitatively."""
     y, sr = sf.read(REC / f"{req.recording}.wav", dtype="float32")
     ref_f = REC / f"{req.recording}.txt"
-    reference = ref_f.read_text() if ref_f.exists() else ""
+    reference = ref_f.read_text(encoding="utf-8") if ref_f.exists() else ""
     try:
         backend = await asyncio.to_thread(backends.get, req.backend)
     except backends.BackendUnavailable as e:
@@ -136,7 +192,11 @@ async def replay(req: ReplayRequest):
 
 def main():
     import argparse
+    import importlib.util
     import uvicorn
+    if not any(importlib.util.find_spec(m) for m in ("websockets", "wsproto")):
+        raise SystemExit("no WebSocket library: live recording (/ws) cannot work. "
+                         "Run: pip install 'uvicorn[standard]'")
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
